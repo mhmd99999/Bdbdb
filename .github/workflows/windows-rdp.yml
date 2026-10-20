@@ -1,56 +1,48 @@
- name: Windows Cloud RDP
+name: CI
 
-on:
-  workflow_dispatch:
+on: [push, workflow_dispatch]
 
 jobs:
   build:
     runs-on: windows-latest
-    timeout-minutes: 360
 
     steps:
-      - name: 1. Enable Remote Desktop & Firewall
-        run: |
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -name "fDenyTSConnections" -Value 0
-          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -name "UserAuthentication" -Value 0
+    - name: Enable Remote Desktop
+      run: |
+        Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -name "fDenyTSConnections" -Value 0
+        Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+        Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -name "UserAuthentication" -Value 1
+    - name: Set runneradmin password
+      run: Set-LocalUser -Name "runneradmin" -Password (ConvertTo-SecureString -AsPlainText "Andero1!" -Force)
 
-      - name: 2. Create Admin Account
-        run: |
-          $Password = ConvertTo-SecureString "P@ssw0rd1qazXSW@#" -AsPlainText -Force
-          New-LocalUser -Name "NvDAdmin" -Password $Password -PasswordNeverExpires -ErrorAction SilentlyContinue
-          Add-LocalGroupMember -Group "Administrators" -Member "NvDAdmin" -ErrorAction SilentlyContinue
-          net user runneradmin P@ssw0rd1qazXSW@#
-
-      - name: 3. Install & Connect Tailscale VPN
-        env:
-          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
-        run: |
-          # Download and install Tailscale silently
-          Invoke-WebRequest "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" -OutFile "C:\tailscale.msi"
-          Start-Process msiexec -ArgumentList "/i C:\tailscale.msi /quiet /norestart" -Wait
-          
-          # Connect to Tailscale network
+    - name: Install WinRAR
+      shell: cmd
+      run: |
+        powershell -Command "Invoke-WebRequest -Uri 'https://www.rarlab.com/rar/winrar-x64-701.exe' -OutFile 'winrar.exe'"
+        winrar.exe /S
+        if exist "C:\Program Files\WinRAR\WinRAR.exe" (echo WinRAR installed successfully!) else (echo Failed to install WinRAR & exit 1)
+    - name: Install psutil
+      shell: cmd
+      run: |
+        pip install psutil
+    - name: Create TCP tunnel with Bore
+      shell: pwsh
+      run: |
+        New-Item -ItemType Directory -Path "tools" -Force
+        Invoke-WebRequest -Uri 'https://github.com/ekzhang/bore/releases/download/v0.5.3/bore-v0.5.3-x86_64-pc-windows-msvc.zip' -OutFile 'tools\bore.zip'
+        Expand-Archive -Path 'tools\bore.zip' -DestinationPath 'tools' -Force
+        while ($true) {
+          $process = Start-Process -FilePath "tools\bore.exe" -ArgumentList "local 3389 --to bore.pub" -NoNewWindow -PassThru -RedirectStandardOutput "bore.log"
           Start-Sleep -Seconds 5
-          & "C:\Program Files\Tailscale\tailscale.exe" up --authkey="$Env:TAILSCALE_AUTHKEY" --hostname="github-rdp-server"
-          
-          Start-Sleep -Seconds 8
-          
-          # Get Tailscale IP
-          $ts_ip = & "C:\Program Files\Tailscale\tailscale.exe" ip -4
-          
-          Write-Host ""
-          Write-Host "==================================================" -ForegroundColor Green
-          Write-Host "  >>> RDP SERVER IS READY! <<<" -ForegroundColor Cyan
-          Write-Host "  Tailscale IP : $ts_ip" -ForegroundColor Yellow
-          Write-Host "  Username     : NvdAdmin" -ForegroundColor Yellow
-          Write-Host "  Password     : P@ssw0rd1qazXSW@#" -ForegroundColor Yellow
-          Write-Host "  >> Open mstsc and connect to: $ts_ip" -ForegroundColor Magenta
-          Write-Host "==================================================" -ForegroundColor Green
-
-      - name: 4. Keep Server Alive (48 Hours)
-        run: |
-          for ($i = 1; $i -le 2880; $i++) {
-            Start-Sleep -Seconds 60
-            Write-Host "[$i/2880] Server running..."
+          $log = Get-Content -Path "bore.log" -Raw
+          if ($log -match "listening at bore.pub:(\d+)") {
+            $port = $matches[1]
+            Write-Output "Tunnel is active at bore.pub:$port"
+            $process.WaitForExit()
+            Write-Output "Bore process exited, restarting..."
+          } else {
+            Write-Output "Failed to create tunnel, retrying..."
+            Stop-Process -Id $process.Id -Force
           }
+          Start-Sleep -Seconds 5
+        }
